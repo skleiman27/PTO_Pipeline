@@ -11,7 +11,7 @@
 
 #IF BREAK REPLACE TQDM.write WITH print
 
- 
+  
 import os
 import os.path
 import glob
@@ -20,33 +20,45 @@ from tqdm import tqdm
 import math
 import warnings
 import argparse
+import time
+import shutil
 
 #Numpy,matplotlib,etc.
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 import pandas as pd
 from IPython.display import Image
 
 #Astropy
 #from astropy.visualization import ZScaleInterval
+import astropy
 from astropy.io import fits
-from scipy.ndimage import shift
+import astropy.stats as stat
 from astropy.stats import mad_std
 from astropy.stats import sigma_clip
+from astropy.modeling import models, fitting
+from astropy.convolution import convolve
+from astropy.visualization import SimpleNorm
+from astropy.stats import SigmaClip
+
+
+from scipy.ndimage import shift
+from scipy.signal import fftconvolve
+from scipy.ndimage import gaussian_filter
+import scipy.signal
+
 import photutils.psf_matching as psf
 from photutils.utils import calc_total_error
-import astropy.stats as stat
+from photutils.psf import CircularGaussianSigmaPRF
+from photutils.psf_matching import make_kernel, make_wiener_kernel, SplitCosineBellWindow
 from photutils.aperture import aperture_photometry, ApertureStats, CircularAperture, CircularAnnulus
 from photutils.detection import DAOStarFinder
-import astropy
+from photutils.profiles import CurveOfGrowth
+from photutils.background import Background2D, MedianBackground
 
-import matplotlib.cm as cm
-import scipy.signal
-import time
-import shutil
-import scipy.signal
+
 from skimage.registration import phase_cross_correlation
-from scipy.ndimage import gaussian_filter
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 terminal_width = os.get_terminal_size().columns
@@ -64,6 +76,8 @@ parser.add_argument('-r', '--rsubtraction', default=False, \
                         help='Whether to use r subtraction instead of Ha (subtraction)')
 parser.add_argument('-s', '--skipreduction', \
                         help = 'Whether to skip data reduction and start from  shift/stacking (True/False)', default=False)
+parser.add_argument('-o', '--omitstacking', \
+                        help = 'Whether to skip stacking and shifting or to just use existing master ims', default = False)
 
 
 parser.add_argument('datafolder')
@@ -288,6 +302,10 @@ def cross_image(im1, im2):
     xshape1, yshape1 = im1.shape
     im2 = fits.getdata(im2)
     xshape2, yshape2 = im2.shape
+    #plt.figure()
+    #plt.imshow(im1,vmin=0,vmax=3)
+    #plt.figure()
+    #plt.imshow(im2,vmin=0,vmax=3)
 
     im1 = im1[200:xshape1-200,200:yshape1-200]
     im2 = im2[200:xshape2-200,200:yshape2-200]
@@ -310,8 +328,8 @@ def cross_image(im1, im2):
     im2 = np.nan_to_num(im2)
 
     # Apply Gaussian high-pass filter to remove low-frequency variations
-    im1_hp = im1 - gaussian_filter(im1, sigma=5) #is usually 10
-    im2_hp = im2 - gaussian_filter(im2, sigma=5)
+    im1_hp = im1 - gaussian_filter(im1, sigma=2) #is usually 10
+    im2_hp = im2 - gaussian_filter(im2, sigma=2)
 
     # Normalize intensity ranges
     im1_hp = (im1_hp - np.mean(im1_hp)) / np.std(im1_hp)
@@ -347,30 +365,36 @@ def centroid_one_star(ref_image,target_image,star_bound,background_bound):
     '''
     ref_fits = fits.getdata(ref_image)
     #Extracts reference star bounds and background
-    star_bound = star_bound.astype(int)
-    background_bound = background_bound.astype(int)
+    #star_bound = star_bound.astype(int)
+    #background_bound = background_bound.astype(int)
     ref_background = ref_fits[background_bound[1][0]:background_bound[1][1],background_bound[0][0]:background_bound[0][1]]
     ref_star = ref_fits[star_bound[1][0]:star_bound[1][1],star_bound[0][0]:star_bound[0][1]]
     
     #First find the background of the reference
-    ref_median = np.median(ref_background)
-    
+    ref_med = np.median(ref_background)
+    ref_std = np.std(ref_background)
+    ref_threshhold = ref_med + 3*ref_std    
     #Now set up the array for our weighted/unweighted pixels
     ref_x_weight = []
     ref_y_weight = []
     ref_no_weight = []
 
      #Nested for loops for x/y weighted pixels
-    for x in np.arange(0,ref_star.shape[1]):
-        for y in np.arange(0,ref_star.shape[0]):
-            ref_x_weight.append((ref_star[x,y]-ref_median)*x)
-            ref_y_weight.append((ref_star[x,y]-ref_median)*y)
-            ref_no_weight.append(ref_star[x,y]-ref_median)
+    for y in np.arange(0,ref_star.shape[1]):
+        for x in np.arange(0,ref_star.shape[0]):
+            if ref_star[y,x] > ref_threshhold:
+                x_weight = (ref_star[y,x]-ref_med)*x
+                y_weight = (ref_star[y,x]-ref_med)*y
+                no_weight= ref_star[y,x]-ref_med
+                ref_x_weight.append(x_weight)
+                ref_y_weight.append(y_weight)
+                ref_no_weight.append(no_weight)
+
 
     #Calculate the reference image's centroid 
     ref_x_centroid = sum(ref_x_weight)/sum(ref_no_weight)
     ref_y_centroid = sum(ref_y_weight)/sum(ref_no_weight)
-    ref_centroid = [ref_x_centroid,ref_y_centroid]
+    ref_centroid = [ref_y_centroid,ref_x_centroid]
     
     #Calculate the shifts as compared to the reference centroid
     
@@ -385,25 +409,32 @@ def centroid_one_star(ref_image,target_image,star_bound,background_bound):
     #Extracing star+background patches
     img_background = img_fits[background_bound[1][0]:background_bound[1][1],background_bound[0][0]:background_bound[0][1]]
     img_star = img_fits[star_bound[1][0]:star_bound[1][1],star_bound[0][0]:star_bound[0][1]]
-        
-    #Calculating the background
-    img_median = np.median(img_background)
+
+    img_med = np.median(img_background)
+    img_std = np.std(img_background)
+    img_threshhold = img_med + 3*img_std
         
     #Nested for loops for x/y weighted pixels
-    for x in np.arange(0,ref_star.shape[1]):
-        for y in np.arange(0,ref_star.shape[0]):
-            img_x_weight.append((img_star[x,y]-img_median)*x)
-            img_y_weight.append((img_star[x,y]-img_median)*y)
-            img_no_weight.append(img_star[x,y]-img_median)
+    for y in np.arange(0,img_star.shape[1]):
+        for x in np.arange(0,img_star.shape[0]):
+            if img_star[y,x] > img_threshhold:
+                x_weight = (img_star[y,x]-img_med)*x
+                y_weight = (img_star[y,x]-img_med)*y
+                no_weight= img_star[y,x]-img_med
+                img_x_weight.append(x_weight)
+                img_y_weight.append(y_weight)
+                img_no_weight.append(no_weight)
                 
     #Calculate the image's centroid
+    # print(sum(img_x_weight))
+    # print(sum(img_no_weight))
     img_x_centroid = sum(img_x_weight)/sum(img_no_weight)
     img_y_centroid = sum(img_y_weight)/sum(img_no_weight)
-    img_centroid = [img_x_centroid,img_y_centroid]
+    img_centroid = [img_y_centroid,img_x_centroid]
         
     #Calculate the x/y shifts, print them, and add them to the list
-    x_shift = ref_centroid[0] - img_centroid[0]
-    y_shift = ref_centroid[1] - img_centroid[1]
+    x_shift = ref_centroid[1] - img_centroid[1]
+    y_shift = ref_centroid[0] - img_centroid[0]
     xy_shift = [x_shift,y_shift]
     return xy_shift
 
@@ -532,8 +563,8 @@ def reg_and_stack(file_list, offsets, padding_size, stacked_path):
         header = fits.getheader(file)
         im_now = fits.getdata(file)
         shift_y, shift_x = offsets[i]
-        shift_y = -1*shift_y
-        shift_x = -1*shift_x
+        shift_y = shift_y
+        shift_x = shift_x
 
         # Handle NaNs
         im_now[np.isnan(im_now)] = 0
@@ -566,6 +597,110 @@ def reg_and_stack(file_list, offsets, padding_size, stacked_path):
     save_path = stacked_path
     fits.writeto(save_path+'/registered_'+image_type+'.fits', stacked_median, header, overwrite=True)
     return
+
+def get_psf(target_image,star_bound,background_bound,size):
+    '''
+    This function takes the centroid of the area specified in a reference image (intended to be one star), 
+    then takes the centroid of the same area in the specified list of images, 
+    and calculates the shifts required to map them to the reference image.
+    Inputs:
+    ref_image (str): the filepath of the reference image
+    target_image (str): the filepath of the target image
+    star_bound (np array): the bounds for the box of which to centroid, in [[xmin,xmax],[ymin,ymax]] form
+    background_bound (np array): the bounds for the box of which to calculate the background from, in [[xmin,xmax],[ymin,ymax]] form
+    Outputs:
+    xy_shift (list): the x and y shifts for the target image
+    '''
+    
+    #Calculate the shifts as compared to the reference centroid
+    
+    #Set our sum arrays to nothing
+    img_x_weight = []
+    img_y_weight = []
+    img_no_weight = []
+        
+    #Converting the fits to a np.array
+    img_fits = fits.getdata(target_image)
+
+    #Extracing star+background patches
+    img_background = img_fits[background_bound[1][0]:background_bound[1][1],background_bound[0][0]:background_bound[0][1]]
+    img_star = img_fits[star_bound[1][0]:star_bound[1][1],star_bound[0][0]:star_bound[0][1]]
+    #plt.imshow(img_star)
+    #plt.xlim(150,200)
+    #plt.ylim(100,150)
+    #Calculating the background
+    bg_med = np.median(img_background)
+    bg_std = np.std(img_background)
+    threshhold = bg_med + 3*bg_std
+    # img_reduced = img_star - bg_med
+
+    #plt.imshow(img_star,vmin=-1,vmax=5)
+    #plt.colorbar()
+        
+    #Nested for loops for x/y weighted pixels
+    for x in np.arange(0,img_star.shape[1]):
+        for y in np.arange(0,img_star.shape[0]):
+            if img_star[x,y] > threshhold:
+                x_weight = (img_star[x,y]-bg_med)*x
+                y_weight = (img_star[x,y]-bg_med)*y
+                no_weight= img_star[x,y]-bg_med
+                img_x_weight.append(x_weight)
+                img_y_weight.append(y_weight)
+                img_no_weight.append(no_weight)
+                
+    #Calculate the image's centroid
+    print(sum(img_x_weight))
+    print(sum(img_no_weight))
+    img_x_centroid = sum(img_x_weight)/sum(img_no_weight)
+    img_y_centroid = sum(img_y_weight)/sum(img_no_weight)
+    img_centroid = [img_y_centroid,img_x_centroid]
+    print(img_centroid)
+    starbox = img_star[int(img_x_centroid)-size:int(img_x_centroid)+size+1, int(img_y_centroid)-size:int(img_y_centroid)+size+1]
+    plt.imshow(starbox)
+    plt.scatter(size+1,size+1, color='red')
+    plt.colorbar
+
+
+
+    y, x, = np.mgrid[:size*2+1, :size*2+1]
+    print(np.shape(starbox))
+    f_init = models.Gaussian2D(amplitude = starbox[size+1,size+1]-np.median(img_background),x_mean=int(size+1), y_mean = int(size+1))
+    fit_f = fitting.LevMarLSQFitter()
+
+    f = fit_f(f_init, x, y, starbox-np.median(img_background))
+    std_devs = np.array([f.x_stddev[0],f.y_stddev[0]])
+    fwhm = 2.335*std_devs
+    fwhm = np.sqrt(fwhm[0]**2+fwhm[1]**2)
+
+
+    psf_fin = f(x,y)/np.sum(f(x,y))
+
+
+    return img_centroid, psf_fin, starbox, fwhm
+
+def background_subtract(img):
+    """
+    Subtracts out the background from an image
+    Inputs:
+    img (str): filepath to image to be subtracted
+
+    Outputs:
+    writes subtracted image out!
+    """
+    data = fits.getdata(img)
+    hdr = fits.getheader(img)
+
+    sigma_clip = SigmaClip(sigma=3.0)
+    bkg_estimator = MedianBackground()
+    bkg = Background2D(data, (15, 15), filter_size=(3, 3),
+                   sigma_clip=sigma_clip, bkg_estimator=bkg_estimator)
+    
+    new_data = data-bkg.background
+
+    fits.writeto(os.path.dirname(img)+'/s_' + os.path.basename(img), new_data, hdr, overwrite=True)
+    return new_data
+
+
 
 #Error estimation function
 def bg_error_estimate(fitsfile):
@@ -932,6 +1067,54 @@ def reduction(datafolder,objname):
     image_n_fdb_V = glob.glob(datafolder+'/'+objname+'/V/n_fdb*')
     image_n_fdb_R = glob.glob(datafolder+'/'+objname+'/R/n_fdb*')
 
+    if flag_B == True:
+        pbar = tqdm(total = len(image_n_fdb_B), desc = "B Image Background Subtraction", colour = "blue")#, leave = False)
+        for im in image_n_fdb_B:
+            background_subtract(im)
+            pbar.update(1)
+        tqdm.write("B Backgrounds Subtracted")
+        pbar.close()
+
+    if flag_V == True:
+        pbar = tqdm(total = len(image_n_fdb_V), desc = "V Image Background Subtraction", colour = "green")#, leave = False)
+        for im in image_n_fdb_V:
+            background_subtract(im)
+            pbar.update(1)
+        tqdm.write("V Backgrounds Subtracted")
+        pbar.close()
+
+    if flag_R == True:
+        pbar = tqdm(total = len(image_n_fdb_R), desc = "R Image Background Subtraction", colour = "red")#, leave = False)
+        for im in image_n_fdb_R:
+            background_subtract(im)
+            pbar.update(1)
+        tqdm.write("R Backgrounds Subtracted")
+        pbar.close()
+
+    if flag_HaON == True:
+        pbar = tqdm(total = len(image_n_fdb_HaON), desc = "HaON Image Background Subtraction", colour = 'magenta')#, leave = False)
+        for im in image_n_fdb_HaON:
+            background_subtract(im)
+            pbar.update(1)
+        tqdm.write("HaON Backgrounds Subtracted")
+        pbar.close()
+
+    if flag_HaOFF == True:
+        pbar = tqdm(total = len(image_n_fdb_HaOFF), desc = "HaOFF Image Background Subtraction", colour = 'cyan')#, leave = False)
+        for im in image_n_fdb_HaOFF:
+            background_subtract(im)
+            pbar.update(1)
+        tqdm.write("HaOFF Backgrounds Subtracted")
+        pbar.close()
+
+
+    image_s_n_fdb_HaON = glob.glob(datafolder+'/'+objname+'/HaON/s_n_fdb*')
+    image_s_n_fdb_HaOFF = glob.glob(datafolder+'/'+objname+'/HaOFF/s_n_fdb*')
+    image_s_n_fdb_B = glob.glob(datafolder+'/'+objname+'/B/s_n_fdb*')
+    image_s_n_fdb_V = glob.glob(datafolder+'/'+objname+'/V/s_n_fdb*')
+    image_s_n_fdb_R = glob.glob(datafolder+'/'+objname+'/R/s_n_fdb*')
+
+
 
     #We've already found the bounds for each filter, but depending on the what the objname is,
     #we need to specify which bounds we are using, along with the reference image index
@@ -960,8 +1143,8 @@ def reduction(datafolder,objname):
         v_background_bound = [[2486,2507],[413,453]]
         v_index = 5
         #Final alignment bounds
-        general_star_bound = [[2300,2500],[350,550]]
-        general_background_bound = [[2520,2540],[450,470]]
+        star_bound = [[2300,2500],[350,550]]
+        bg_bound = [[2520,2540],[450,470]]
 
     if objname == 'NGC 2785':
         HaON_star_bound = [[900,1000],[560,660]]
@@ -971,8 +1154,8 @@ def reduction(datafolder,objname):
         HaOFF_background_bound = [[900,1000],[400,500]]
         HaOFF_index = 1
         #Final alignment bounds
-        general_star_bound = [[900,1000],[560,660]]
-        general_background_bound = [[900,1000],[400,500]]
+        star_bound = [[900,1000],[560,660]]
+        bg_bound = [[900,1000],[400,500]]
 
     if objname == 'NGC 5297':
         HaON_star_bound = [[1325,1385],[1480,1540]]
@@ -982,8 +1165,8 @@ def reduction(datafolder,objname):
         HaOFF_background_bound = [[1410,1470],[1480,1540]]
         HaOFF_index = 1
         #Final alignment bounds
-        general_star_bound = [[1325,1385],[1480,1540]]
-        general_background_bound = [[1410,1470],[1480,1540]]
+        star_bound = [[1325,1385],[1480,1540]]
+        bg_bound = [[1410,1470],[1480,1540]]
 
     #Initialize shift lists
     xy_HaOFF = []
@@ -1013,101 +1196,107 @@ def reduction(datafolder,objname):
     #    xy_V.append(xy_shift)
     #    pbar.update(1)
     #print("Visual Shifts Computed")
+    if omitstack == True:
+        tqdm.write("Skipping Shifting/Stacking and Using Existing Master Images")
+    else:
+        if flag_B == True:
+            pbar = tqdm(total = len(image_s_n_fdb_B), desc = "B Image Alignment", colour = 'blue')#, leave = False)
+            for im in image_s_n_fdb_B:
+                xy_shift = cross_image(image_s_n_fdb_B[0], im)
+                xy_B.append(xy_shift)
+                pbar.update(1)
+            tqdm.write("B Shifts Computed")
+            pbar.close()
 
-    if flag_B == True:
-        pbar = tqdm(total = len(image_n_fdb_B), desc = "B Image Alignment", colour = 'blue')#, leave = False)
-        for im in image_n_fdb_B:
-            xy_shift = cross_image(im, image_n_fdb_B[0])
-            xy_B.append(xy_shift)
-            pbar.update(1)
-        tqdm.write("B Shifts Computed")
-        pbar.close()
+        if flag_V == True:
+            pbar = tqdm(total = len(image_s_n_fdb_V), desc = "V Image Alignment", colour = 'green')#, leave = False)
+            for im in image_s_n_fdb_B:
+                xy_shift = cross_image(image_s_n_fdb_V[0], im)
+                xy_V.append(xy_shift)
+                pbar.update(1)
+            tqdm.write("V Shifts Computed")
+            pbar.close()
 
-    if flag_V == True:
-        pbar = tqdm(total = len(image_n_fdb_V), desc = "V Image Alignment", colour = 'green')#, leave = False)
-        for im in image_n_fdb_B:
-            xy_shift = cross_image(im, image_n_fdb_V[0])
-            xy_V.append(xy_shift)
-            pbar.update(1)
-        tqdm.write("V Shifts Computed")
-        pbar.close()
+        if flag_R == True:
+            pbar = tqdm(total = len(image_s_n_fdb_R), desc = "R Image Alignment", colour = 'red')#, leave = False)
+            for im in image_s_n_fdb_R:
+                xy_shift = cross_image(image_s_n_fdb_R[0], im)
+                xy_R.append(xy_shift)
+                pbar.update(1)
+            tqdm.write("R Shifts Computed")
+            pbar.close()
+        
+        if flag_HaON == True:
+            pbar = tqdm(total = len(image_s_n_fdb_HaON), desc = "HaON Image Alignment", colour = 'magenta')#, leave = False)
+            tqdm.write("Aligning to: " + image_s_n_fdb_HaON[0])
+            for im in image_s_n_fdb_HaON:
+                tqdm.write(im)
+                tqdm.write(image_s_n_fdb_HaON[0])
+                xy_shift = cross_image(image_s_n_fdb_HaON[0], im)
+                tqdm.write(str(xy_shift))
+                xy_HaON.append(xy_shift)
+                pbar.update(1)
+            tqdm.write("HaON Shifts Computed")
+            pbar.close()
 
-    if flag_R == True:
-        pbar = tqdm(total = len(image_n_fdb_R), desc = "R Image Alignment", colour = 'red')#, leave = False)
-        for im in image_n_fdb_R:
-            xy_shift = cross_image(im, image_n_fdb_R[0])
-            xy_R.append(xy_shift)
-            pbar.update(1)
-        tqdm.write("R Shifts Computed")
-        pbar.close()
-    
-    if flag_HaON == True:
-        pbar = tqdm(total = len(image_n_fdb_HaON), desc = "HaON Image Alignment", colour = 'magenta')#, leave = False)
-        for im in image_n_fdb_HaON:
-            xy_shift = cross_image(im, image_n_fdb_HaON[0])
-            xy_HaON.append(xy_shift)
-            pbar.update(1)
-        tqdm.write("HaON Shifts Computed")
-        pbar.close()
-
-    if flag_HaOFF == True:
-        pbar = tqdm(total = len(image_n_fdb_HaOFF), desc = "HaOFF Image Alignment", colour = 'cyan')#, leave = False)
-        for im in image_n_fdb_HaOFF:
-            xy_shift = cross_image(im, image_n_fdb_HaOFF[0])
-            xy_HaOFF.append(xy_shift)
-            pbar.update(1)
-        tqdm.write("HaOFF Shifts Computed")
-        pbar.close()
+        if flag_HaOFF == True:
+            pbar = tqdm(total = len(image_s_n_fdb_HaOFF), desc = "HaOFF Image Alignment", colour = 'cyan')#, leave = False)
+            for im in image_s_n_fdb_HaOFF:
+                xy_shift = cross_image(image_s_n_fdb_HaOFF[0], im)
+                xy_HaOFF.append(xy_shift)
+                pbar.update(1)
+            tqdm.write("HaOFF Shifts Computed")
+            pbar.close()
 
 
 
-    #pbar = tqdm(total = len(image_HaON), desc = "HaON Image Alignment:")
-    #for im in image_fdb_HaON:
-    #    xy_shift = centroid_one_star(image_n_fdb_HaON[HaON_index], im, np.array(HaON_star_bound), np.array(HaON_background_bound))
-    #    xy_HaON.append(xy_shift)
-    #    pbar.update(1)
-    #print("HaON Shifts Computed")
-    #print(xy_HaON)
+        #pbar = tqdm(total = len(image_HaON), desc = "HaON Image Alignment:")
+        #for im in image_fdb_HaON:
+        #    xy_shift = centroid_one_star(image_n_fdb_HaON[HaON_index], im, np.array(HaON_star_bound), np.array(HaON_background_bound))
+        #    xy_HaON.append(xy_shift)
+        #    pbar.update(1)
+        #print("HaON Shifts Computed")
+        #print(xy_HaON)
 
-    #pbar = tqdm(total = len(image_HaOFF), desc = "HaOFF Image Alignment:")
-    #for im in image_fdb_HaOFF:
-    #    xy_shift = centroid_one_star(image_n_fdb_HaOFF[HaOFF_index], im, np.array(HaOFF_star_bound), np.array(HaOFF_background_bound))
-    #    xy_HaOFF.append(xy_shift)
-    #    pbar.update(1)
-    #print("HaOFF Shifts Computed")
+        #pbar = tqdm(total = len(image_HaOFF), desc = "HaOFF Image Alignment:")
+        #for im in image_fdb_HaOFF:
+        #    xy_shift = centroid_one_star(image_n_fdb_HaOFF[HaOFF_index], im, np.array(HaOFF_star_bound), np.array(HaOFF_background_bound))
+        #    xy_HaOFF.append(xy_shift)
+        #    pbar.update(1)
+        #print("HaOFF Shifts Computed")
 
-    #Next, align + stack the images in those arrays
-    #Red first
-    #simple_image_combination(image_fdb_red, np.array(xy_red), np.max(xy_red), datafolder+'/'+objname+'/red')
-    #print("Red Images Stacked")
-    #Then blue
-    #simple_image_combination(image_fdb_blue, np.array(xy_blue), np.max(xy_blue), datafolder+'/'+objname+'/blue')
-    #print("Blue Images Stacked")
-    #Then visual
-    if flag_B == True:
-        reg_and_stack(image_n_fdb_B, np.array(xy_B), math.ceil(np.max(xy_B)), datafolder+'/'+objname+'/B')
-        tqdm.write("B Images Stacked")
-        pbar.close()
+        #Next, align + stack the images in those arrays
+        #Red first
+        #simple_image_combination(image_fdb_red, np.array(xy_red), np.max(xy_red), datafolder+'/'+objname+'/red')
+        #print("Red Images Stacked")
+        #Then blue
+        #simple_image_combination(image_fdb_blue, np.array(xy_blue), np.max(xy_blue), datafolder+'/'+objname+'/blue')
+        #print("Blue Images Stacked")
+        #Then visual
+        if flag_B == True:
+            reg_and_stack(image_s_n_fdb_B, np.array(xy_B), math.ceil(np.max(xy_B)), datafolder+'/'+objname+'/B')
+            tqdm.write("B Images Stacked")
+            pbar.close()
 
-    if flag_V == True:
-        reg_and_stack(image_n_fdb_V, np.array(xy_V), math.ceil(np.max(xy_V)), datafolder+'/'+objname+'/V')
-        tqdm.write("V Images Stacked")
-        pbar.close()
+        if flag_V == True:
+            reg_and_stack(image_s_n_fdb_V, np.array(xy_V), math.ceil(np.max(xy_V)), datafolder+'/'+objname+'/V')
+            tqdm.write("V Images Stacked")
+            pbar.close()
 
-    if flag_R == True:
-        reg_and_stack(image_n_fdb_R, np.array(xy_R), math.ceil(np.max(xy_R)), datafolder+'/'+objname+'/R')
-        tqdm.write("R Images Stacked")
-        pbar.close()
+        if flag_R == True:
+            reg_and_stack(image_s_n_fdb_R, np.array(xy_R), math.ceil(np.max(xy_R)), datafolder+'/'+objname+'/R')
+            tqdm.write("R Images Stacked")
+            pbar.close()
 
-    if flag_HaON == True:
-        reg_and_stack(image_n_fdb_HaON, np.array(xy_HaON), math.ceil(np.max(xy_HaON)), datafolder+'/'+objname+'/HaON')
-        tqdm.write("HaON Images Stacked")
-        pbar.close()
+        if flag_HaON == True:
+            reg_and_stack(image_s_n_fdb_HaON, np.array(xy_HaON), math.ceil(np.max(xy_HaON)), datafolder+'/'+objname+'/HaON')
+            tqdm.write("HaON Images Stacked")
+            pbar.close()
 
-    if flag_HaOFF == True:
-        reg_and_stack(image_n_fdb_HaOFF, np.array(xy_HaOFF), math.ceil(np.max(xy_HaOFF)), datafolder+'/'+objname+'/HaOFF')
-        tqdm.write("HaOFF Images Stacked")
-        pbar.close()
+        if flag_HaOFF == True:
+            reg_and_stack(image_s_n_fdb_HaOFF, np.array(xy_HaOFF), math.ceil(np.max(xy_HaOFF)), datafolder+'/'+objname+'/HaOFF')
+            tqdm.write("HaOFF Images Stacked")
+            pbar.close()
     
     #Finally, align all the images 
     #We will align relative to the red band
@@ -1126,10 +1315,10 @@ def reduction(datafolder,objname):
     if flag_HaOFF == True:
         HaOFF_path = glob.glob(datafolder+'/'+objname+'/HaOFF/registered*')[0]
     ######################################################################################################
-    if flag_HaON == True:
-        ref_path = HaON_path
-    elif flag_HaOFF == True:
+    if flag_HaOFF == True:
         ref_path = HaOFF_path
+    elif flag_HaON == True:
+        ref_path = HaON_path
     elif flag_B == True:
         ref_path = B_path
     elif flag_V == True:
@@ -1142,22 +1331,31 @@ def reduction(datafolder,objname):
     #visual_shift = centroid_one_star(red_path, visual_path, np.array(general_star_bound), np.array(general_background_bound))
 
 ### INSERT PSF CONVOLUTION HERE
-    raise Warning("Shifting and Stacking Completed!")
+
+    if objname == "standard":
+        star_bound = [[800,1100],[890,1190]]
+        bg_bound = [[1100,1400],[800,1100]]
+    if objname == "NGC 5297":
+        star_bound = [[1600,1900],[550,850]] #1740 696, 1723, 698, 1720, 704
+        bg_bound = [[1700,1900],[750,950]]
+    if objname == "NGC 2785":
+        star_bound = [[1530,1770],[1200,1440]]
+        bg_bound = [[1240,1480],[1360,1600]]
 
     if flag_B == True:
-        B_shift = cross_image(B_path, ref_path)
+        B_shift = centroid_one_star(ref_path, B_path, star_bound, bg_bound)
     if flag_V == True:
-        V_shift = cross_image(V_path, ref_path)
+        V_shift = centroid_one_star(ref_path, V_path, star_bound, bg_bound)
     if flag_R == True:
-        R_shift = cross_image(R_path, ref_path)
+        R_shift = centroid_one_star(ref_path, R_path, star_bound, bg_bound)
     if flag_HaON == True:
-        HaON_shift = cross_image(HaON_path, ref_path)
-        tqdm.write("HaON SHIFT")
-        tqdm.write(HaON_shift)
+        HaON_shift = centroid_one_star(ref_path, HaON_path, star_bound, bg_bound)
+        #tqdm.write("HaON SHIFT")
+        #tqdm.write(str(HaON_shift))
     if flag_HaOFF == True:
-        HaOFF_shift = cross_image(HaOFF_path, ref_path)
-        tqdm.write("HaOFF SHIFT")
-        tqdm.write(HaOFF_shift)
+        HaOFF_shift = centroid_one_star(ref_path, HaOFF_path, star_bound, bg_bound)
+        #tqdm.write("HaOFF SHIFT")
+        #tqdm.write(str(HaOFF_shift))
     #Then shift the actual images
     median_images = []
     registered_shifts0 = []
@@ -1184,8 +1382,8 @@ def reduction(datafolder,objname):
         registered_shifts1.append(HaOFF_shift[1])
 
 
-    print(registered_shifts0)
-    print(registered_shifts1)
+    #print(registered_shifts0)
+    #print(registered_shifts1)
 
 
     #For loop for shifting each image (NOT stacking them)
@@ -1198,19 +1396,19 @@ def reduction(datafolder,objname):
         #Removing artifact values
         image[np.isinf(image)] = 0.0
         image[np.isnan(image)] = 0.0
-        print(image.shape[0])
+        #print(image.shape[0])
         #Padding + shifting
         #Need to pad up to a specific value (so that the final arrays all have the same shape)
         max0 = np.max(registered_shifts0)
         max1 = np.max(registered_shifts1)
-        print(max0,max1)
+        #print(max0,max1)
         maxall = max(max0,max1)
         
         pad_specific = math.ceil(maxall)
 
         #pad_specific = int((2200 - image.shape[0])/2)
-        print(registered_shifts0)
-        print(registered_shifts1)
+        #print(registered_shifts0)
+        #print(registered_shifts1)
         padded_image = np.pad(image, pad_specific, 'constant', constant_values = 0.001)
         new_image = shift(padded_image, (-1*float(registered_shifts1[m]),-1*float(registered_shifts0[m])), cval = 0.001)
 
@@ -1220,19 +1418,193 @@ def reduction(datafolder,objname):
         #Writing the new image with the prefix align_ (for aligned to the standard image)
         fits.writeto(os.path.dirname(file)+'/align_' + os.path.basename(file), 
                     cropped_image, image_header, overwrite=True)
-        print("Aligned: " + str(file))
+        tqdm.write("Aligned: " + str(file))
+
+######### PSF STUFF!
+    tqdm.write("Calculating PSFs")
+    
+        
+    if flag_B == True:
+        B_path = glob.glob(datafolder+'/'+objname+'/B/align*')[0]
+    if flag_V == True:
+        V_path = glob.glob(datafolder+'/'+objname+'/V/align*')[0]
+    if flag_R == True:
+        R_path = glob.glob(datafolder+'/'+objname+'/R/align*')[0]
+    if flag_HaON == True:
+        HaON_path = glob.glob(datafolder+'/'+objname+'/HaON/align*')[0]
+    if flag_HaOFF == True:
+        HaOFF_path = glob.glob(datafolder+'/'+objname+'/HaOFF/align*')[0]
+
+    keydata = []
+    ###Extract PSFs and FWHMs
+    if flag_B == True:
+        centB, psfB, starboxB, fwhmB = get_psf(B_path, star_bound, bg_bound,50)
+        keydata.append(['B',fwhmB,psfB,B_path])
+    if flag_V == True:
+        centV, psfV, starboxV, fwhmV = get_psf(V_path, star_bound, bg_bound,50)
+        keydata.append(['V',fwhmV,psfV,V_path])
+    if flag_R == True:
+        centR, psfR, starboxR, fwhmR = get_psf(R_path, star_bound, bg_bound,50)
+        keydata.append(['R',fwhmR,psfR,R_path])
+    if flag_HaON == True:
+        centHaON, psfHaON, starboxHaON, fwhmHaON = get_psf(HaON_path, star_bound, bg_bound,50)
+        keydata.append(['HaON',fwhmHaON,psfHaON,HaON_path])
+    if flag_HaOFF == True:
+        centHaOFF, psfHaOFF, starboxHaOFF, fwhmHaOFF = get_psf(HaOFF_path, star_bound, bg_bound,50)
+        keydata.append(['HaOFF',fwhmHaOFF,psfHaOFF,HaOFF_path])
+
+    df = pd.DataFrame(keydata, columns=['filt', 'fwhm', 'psf','filepath'])
+    print(df)
+    max_row = df.loc[df['fwhm'].idxmax()]
+    tqdm.write(f"Convolving Images to match PSF of {max_row.filt}!")
+    pbar = tqdm(total = len(df), desc = "Convolving Images", leave = False)
+    for idx, row in df.iterrows():
+        # if row.filt == max_row.filt:
+        #     tqdm.write("Filters Match! Skipping Convolution")
+        #     newdata = fits.getdata(row.filepath)
+        # else:
+        kernellap = make_wiener_kernel(row.psf,max_row.psf, penalty="laplacian", regularization=1.082e-5)
+        newdata = fftconvolve(fits.getdata(row.filepath), kernellap)
+        header = fits.getheader(row.filepath)
+        fits.writeto(datafolder+'/'+objname+'/' +row.filt+  f'/convolved_{row.filt}.fits', newdata, header, overwrite=True)
+        pbar.update(1)
+    pbar.close()
+    tqdm.write("CONVOLVED ALL IMAGES!")
+
+    #REALIGN IMAGES
+    
+    if flag_B == True:
+        B_path = glob.glob(datafolder+'/'+objname+'/B/convolved*')[0]
+    if flag_V == True:
+        V_path = glob.glob(datafolder+'/'+objname+'/V/convolved*')[0]
+    if flag_R == True:
+        R_path = glob.glob(datafolder+'/'+objname+'/R/convolved*')[0]
+    if flag_HaON == True:
+        HaON_path = glob.glob(datafolder+'/'+objname+'/HaON/convolved*')[0]
+    if flag_HaOFF == True:
+        HaOFF_path = glob.glob(datafolder+'/'+objname+'/HaOFF/convolved*')[0]
+
+    if flag_HaOFF == True:
+        ref_path = HaOFF_path
+    elif flag_HaON == True:
+        ref_path = HaON_path
+    elif flag_B == True:
+        ref_path = B_path
+    elif flag_V == True:
+        ref_path = V_path
+    elif flag_R == True:
+        ref_path == R_path
+
+    tqdm.write(f'Ref Image: {ref_path}')
+    if flag_B == True:
+        B_shift = centroid_one_star(ref_path, B_path, star_bound, bg_bound)
+        tqdm.write(f'B SHIFT: {B_shift}')
+    if flag_V == True:
+        V_shift = centroid_one_star(ref_path, V_path, star_bound, bg_bound)
+        tqdm.write(f'V SHIFT: {V_shift}')
+    if flag_R == True:
+        R_shift = centroid_one_star(ref_path, R_path, star_bound, bg_bound)
+        tqdm.write(f'R SHIFT: {R_shift}')
+    if flag_HaON == True:
+        HaON_shift = centroid_one_star(ref_path, HaON_path, star_bound, bg_bound)
+        tqdm.write(f'HaON SHIFT: {HaON_shift}')
+    if flag_HaOFF == True:
+        HaOFF_shift = centroid_one_star(ref_path, HaOFF_path, star_bound, bg_bound)
+        tqdm.write(f'HaOFF SHIFT: {HaOFF_shift}')
+
+    #Then shift the actual images
+    median_images = []
+    registered_shifts0 = []
+    registered_shifts1 = []
+
+    if flag_B == True:
+        median_images.append(B_path)
+        registered_shifts0.append(B_shift[0])
+        registered_shifts1.append(B_shift[1])
+    if flag_V == True:
+        median_images.append(V_path)
+        registered_shifts0.append(V_shift[0])
+        registered_shifts1.append(V_shift[1])
+    if flag_R == True:
+        median_images.append(R_path)
+        registered_shifts0.append(R_shift[0])
+        registered_shifts1.append(R_shift[1])
+    if flag_HaON == True:
+        median_images.append(HaON_path)
+        registered_shifts0.append(HaON_shift[0])
+        registered_shifts1.append(HaON_shift[1])
+    if flag_HaOFF == True:
+        median_images.append(HaOFF_path)
+        registered_shifts0.append(HaOFF_shift[0])
+        registered_shifts1.append(HaOFF_shift[1])
+
+    print(median_images)
+    tqdm.write("Shifting Convolved Images")
+    for m in np.arange(0,len(median_images)):
+        file = median_images[m]
+        image = fits.getdata(file)
+        image_header = fits.getheader(file)
+        original_shape = image.shape
+        #Removing artifact values
+        image[np.isinf(image)] = 0.0
+        image[np.isnan(image)] = 0.0
+        #print(image.shape[0])
+        #Padding + shifting
+        #Need to pad up to a specific value (so that the final arrays all have the same shape)
+        max0 = np.max(registered_shifts0)
+        max1 = np.max(registered_shifts1)
+        #print(max0,max1)
+        maxall = max(max0,max1)
+        
+        pad_specific = math.ceil(maxall)
+
+        #pad_specific = int((2200 - image.shape[0])/2)
+        #print(registered_shifts0)
+        #print(registered_shifts1)
+        padded_image = np.pad(image, pad_specific, 'constant', constant_values = 0.001)
+        new_image = shift(padded_image, (float(registered_shifts1[m]),float(registered_shifts0[m])), cval = 0.001)
+
+        pad_y, pad_x = pad_specific, pad_specific
+        cropped_image = new_image[pad_y: pad_y + original_shape[0], pad_x: pad_x + original_shape[1]]
+
+        #Writing the new image with the prefix align_ (for aligned to the standard image)
+        fits.writeto(os.path.dirname(file)+'/final_' + os.path.basename(file), 
+                    cropped_image, image_header, overwrite=True)
+        tqdm.write("Aligned: " + str(file))
+    
+
+    
+
+    
+
+
+    
+
+
+
+
+
+
+
+
+
+
+
+
+######### PSF STUFF!
+
 
 ### SUBTRACT HA ON FROM OFF
-    HaON_aligned = glob.glob(os.path.dirname(HaON_path)+'/align_*')[0]
+    HaON_aligned = glob.glob(os.path.dirname(HaON_path)+'/final*')[0]
     header = fits.getheader(HaON_aligned)
-    HaOFF_aligned = glob.glob(os.path.dirname(HaOFF_path)+'/align_*')[0]
+    HaOFF_aligned = glob.glob(os.path.dirname(HaOFF_path)+'/final*')[0]
     HaON_data = fits.getdata(HaON_aligned)
     HaOFF_data = fits.getdata(HaOFF_aligned)
 
     Ha_DIFF = HaOFF_data - HaON_data
     
     fits.writeto(datafolder +'/'+ objname + '/Ha_difference.fits', Ha_DIFF, header, overwrite = True)
-    print("Subtracted HaON from HaOFF")
+    print("Subtracted HaON from HaOFF!")
 
 
 #Actually run the reduction function
@@ -1255,6 +1627,11 @@ if __name__ == "__main__":
         skipred = True
     else:
         skipred = False
+
+    if opt.omitstacking == "True":
+        omitstack = True
+    else:
+        omitstack = False
 
     
 ######################################################################################################
@@ -1443,7 +1820,7 @@ if __name__ == "__main__":
 #plt.xlabel('B-V Magnitude', fontsize = 17.5)
 #plt.ylabel('V Band Magnitude', fontsize = 17.5)
 #plt.legend(fontsize = 12)
-plt.show()
+#plt.show()
 
 #Finally, calculate the orthogonal residuals
 
