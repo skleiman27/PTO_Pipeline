@@ -10,7 +10,6 @@
 ### Add a testing script/mode for the pipeline
 
 #IF BREAK REPLACE TQDM.write WITH print
-
   
 import os
 import os.path
@@ -40,7 +39,7 @@ from astropy.stats import sigma_clip
 from astropy.modeling import models, fitting
 from astropy.convolution import convolve
 from astropy.visualization import SimpleNorm
-from astropy.stats import SigmaClip
+from astropy.stats import sigma_clipped_stats, SigmaClip
 
 
 from scipy.ndimage import shift
@@ -56,7 +55,8 @@ from photutils.aperture import aperture_photometry, ApertureStats, CircularApert
 from photutils.detection import DAOStarFinder
 from photutils.profiles import CurveOfGrowth
 from photutils.background import Background2D, MedianBackground
-
+from photutils.segmentation import detect_threshold, detect_sources
+from photutils.utils import circular_footprint
 
 from skimage.registration import phase_cross_correlation
 
@@ -678,7 +678,7 @@ def get_psf(target_image,star_bound,background_bound,size):
 
     return img_centroid, psf_fin, starbox, fwhm
 
-def background_subtract(img):
+def background_subtract(img,addtl_mask=None):
     """
     Subtracts out the background from an image
     Inputs:
@@ -690,10 +690,22 @@ def background_subtract(img):
     data = fits.getdata(img)
     hdr = fits.getheader(img)
 
-    sigma_clip = SigmaClip(sigma=3.0)
+    sigma_clip = SigmaClip(sigma=5.0, maxiters=15)
+    threshold = detect_threshold(data, n_sigma=5.0, sigma_clip=sigma_clip)
+    segment_img = detect_sources(data, threshold, n_pixels=30)
+    footprint = circular_footprint(radius=5)
+    mask = segment_img.make_source_mask(footprint=footprint)
+    if addtl_mask != None:
+        for i in np.arange(0,len(addtl_mask)):
+            mask[addtl_mask[i][1][0]:addtl_mask[i][1][1],addtl_mask[i][0][0]:addtl_mask[i][0][1]] = 1
+
+    mean, median, std = sigma_clipped_stats(data, sigma=5.0, mask=mask)
+
     bkg_estimator = MedianBackground()
-    bkg = Background2D(data, (15, 15), filter_size=(3, 3),
-                   sigma_clip=sigma_clip, bkg_estimator=bkg_estimator)
+    bkg = Background2D(data, (15, 15), filter_size=(3,3),
+                   sigma_clip=sigma_clip, bkg_estimator=bkg_estimator,mask=mask)
+    
+    new_data = data-bkg.background
     
     new_data = data-bkg.background
 
@@ -1067,10 +1079,16 @@ def reduction(datafolder,objname):
     image_n_fdb_V = glob.glob(datafolder+'/'+objname+'/V/n_fdb*')
     image_n_fdb_R = glob.glob(datafolder+'/'+objname+'/R/n_fdb*')
 
+
+    if objname == "NGC 2785":
+        gal_mask = [[[250,550],[900,1200]],[[1250,1550],[600,900]]]
+    else: 
+        gal_mask = None
+
     if flag_B == True:
         pbar = tqdm(total = len(image_n_fdb_B), desc = "B Image Background Subtraction", colour = "blue")#, leave = False)
         for im in image_n_fdb_B:
-            background_subtract(im)
+            background_subtract(im,addtl_mask=gal_mask)
             pbar.update(1)
         tqdm.write("B Backgrounds Subtracted")
         pbar.close()
@@ -1078,7 +1096,7 @@ def reduction(datafolder,objname):
     if flag_V == True:
         pbar = tqdm(total = len(image_n_fdb_V), desc = "V Image Background Subtraction", colour = "green")#, leave = False)
         for im in image_n_fdb_V:
-            background_subtract(im)
+            background_subtract(im,addtl_mask=gal_mask)
             pbar.update(1)
         tqdm.write("V Backgrounds Subtracted")
         pbar.close()
@@ -1086,7 +1104,7 @@ def reduction(datafolder,objname):
     if flag_R == True:
         pbar = tqdm(total = len(image_n_fdb_R), desc = "R Image Background Subtraction", colour = "red")#, leave = False)
         for im in image_n_fdb_R:
-            background_subtract(im)
+            background_subtract(im,addtl_mask=gal_mask)
             pbar.update(1)
         tqdm.write("R Backgrounds Subtracted")
         pbar.close()
@@ -1094,7 +1112,7 @@ def reduction(datafolder,objname):
     if flag_HaON == True:
         pbar = tqdm(total = len(image_n_fdb_HaON), desc = "HaON Image Background Subtraction", colour = 'magenta')#, leave = False)
         for im in image_n_fdb_HaON:
-            background_subtract(im)
+            background_subtract(im,addtl_mask=gal_mask)
             pbar.update(1)
         tqdm.write("HaON Backgrounds Subtracted")
         pbar.close()
@@ -1102,7 +1120,7 @@ def reduction(datafolder,objname):
     if flag_HaOFF == True:
         pbar = tqdm(total = len(image_n_fdb_HaOFF), desc = "HaOFF Image Background Subtraction", colour = 'cyan')#, leave = False)
         for im in image_n_fdb_HaOFF:
-            background_subtract(im)
+            background_subtract(im,addtl_mask=gal_mask)
             pbar.update(1)
         tqdm.write("HaOFF Backgrounds Subtracted")
         pbar.close()
@@ -1118,55 +1136,66 @@ def reduction(datafolder,objname):
 
     #We've already found the bounds for each filter, but depending on the what the objname is,
     #we need to specify which bounds we are using, along with the reference image index
-    if objname == 'standard':
-        HaON_star_bound = [[1060,1160],[1030,1130]]
-        HaON_background_bound = [[1060,1160],[830,930]]
-        HaON_index = 1
-        HaOFF_star_bound = [[1060,1160],[1030,1130]]
-        HaOFF_background_bound = [[1060,1160],[830,930]]
-        HaOFF_index = 1
-        #v_star_bound = [[2000,2080],[2190,2270]]
-        #v_background_bound = [[2120,2160],[2210,2250]]
-        #v_index = 4
-        #Final alignment bounds
-        HaOFF_star_bound = [[1060,1160],[1030,1130]]
-        HaOFF_background_bound = [[1060,1160],[830,930]]
+    # if objname == 'standard':
+    #     HaON_star_bound = [[1060,1160],[1030,1130]]
+    #     HaON_background_bound = [[1060,1160],[830,930]]
+    #     HaON_index = 1
+    #     HaOFF_star_bound = [[1060,1160],[1030,1130]]
+    #     HaOFF_background_bound = [[1060,1160],[830,930]]
+    #     HaOFF_index = 1
+    #     #v_star_bound = [[2000,2080],[2190,2270]]
+    #     #v_background_bound = [[2120,2160],[2210,2250]]
+    #     #v_index = 4
+    #     #Final alignment bounds
+    #     HaOFF_star_bound = [[1060,1160],[1030,1130]]
+    #     HaOFF_background_bound = [[1060,1160],[830,930]]
  
-    if objname == 'target':
-        r_star_bound = [[2327,2487],[364,524]]
-        r_background_bound = [[2487,2527],[424,464]]
-        r_index = 14
-        b_star_bound = [[2334,2494],[387,547]]
-        b_background_bound = [[2494,2534],[447,487]]
-        b_index = 12
-        v_star_bound = [[2307,2467],[353,513]]
-        v_background_bound = [[2486,2507],[413,453]]
-        v_index = 5
-        #Final alignment bounds
-        star_bound = [[2300,2500],[350,550]]
-        bg_bound = [[2520,2540],[450,470]]
+    # if objname == 'target':
+    #     r_star_bound = [[2327,2487],[364,524]]
+    #     r_background_bound = [[2487,2527],[424,464]]
+    #     r_index = 14
+    #     b_star_bound = [[2334,2494],[387,547]]
+    #     b_background_bound = [[2494,2534],[447,487]]
+    #     b_index = 12
+    #     v_star_bound = [[2307,2467],[353,513]]
+    #     v_background_bound = [[2486,2507],[413,453]]
+    #     v_index = 5
+    #     #Final alignment bounds
+    #     star_bound = [[2300,2500],[350,550]]
+    #     bg_bound = [[2520,2540],[450,470]]
 
-    if objname == 'NGC 2785':
-        HaON_star_bound = [[900,1000],[560,660]]
-        HaON_background_bound = [[900,1000],[400,500]]
-        HaON_index = 1
-        HaOFF_star_bound = [[900,1000],[560,660]]
-        HaOFF_background_bound = [[900,1000],[400,500]]
-        HaOFF_index = 1
-        #Final alignment bounds
-        star_bound = [[900,1000],[560,660]]
-        bg_bound = [[900,1000],[400,500]]
+    # if objname == 'NGC 2785':
+    #     HaON_star_bound = [[900,1000],[560,660]]
+    #     HaON_background_bound = [[900,1000],[400,500]]
+    #     HaON_index = 1
+    #     HaOFF_star_bound = [[900,1000],[560,660]]
+    #     HaOFF_background_bound = [[900,1000],[400,500]]
+    #     HaOFF_index = 1
+    #     #Final alignment bounds
+    #     star_bound = [[900,1000],[560,660]]
+    #     bg_bound = [[900,1000],[400,500]]
 
-    if objname == 'NGC 5297':
-        HaON_star_bound = [[1325,1385],[1480,1540]]
-        HaON_background_bound = [[1410,1470],[1480,1540]]
-        HaON_index = 1
-        HaOFF_star_bound = [[1325,1385],[1480,1540]]
-        HaOFF_background_bound = [[1410,1470],[1480,1540]]
-        HaOFF_index = 1
-        #Final alignment bounds
-        star_bound = [[1325,1385],[1480,1540]]
-        bg_bound = [[1410,1470],[1480,1540]]
+    # if objname == 'NGC 5297':
+    #     HaON_star_bound = [[1325,1385],[1480,1540]]
+    #     HaON_background_bound = [[1410,1470],[1480,1540]]
+    #     HaON_index = 1
+    #     HaOFF_star_bound = [[1325,1385],[1480,1540]]
+    #     HaOFF_background_bound = [[1410,1470],[1480,1540]]
+    #     HaOFF_index = 1
+    #     #Final alignment bounds
+    #     star_bound = [[1325,1385],[1480,1540]]
+    #     bg_bound = [[1410,1470],[1480,1540]]
+
+    # if objname == 'NGC 5383':
+    #     HaON_star_bound = [[1325,1385],[1480,1540]]
+    #     HaON_background_bound = [[1410,1470],[1480,1540]]
+    #     HaON_index = 1
+    #     HaOFF_star_bound = [[1325,1385],[1480,1540]]
+    #     HaOFF_background_bound = [[1410,1470],[1480,1540]]
+    #     HaOFF_index = 1
+    #     #Final alignment bounds
+    #     star_bound = [[1500,1800],[660,960]]
+    #     bg_bound = [[1500,1700],[900,1100]]
 
     #Initialize shift lists
     xy_HaOFF = []
@@ -1341,6 +1370,9 @@ def reduction(datafolder,objname):
     if objname == "NGC 2785":
         star_bound = [[1530,1770],[1200,1440]]
         bg_bound = [[1240,1480],[1360,1600]]
+    if objname == "NGC 5383":
+        star_bound = [[1500,1800],[660,960]]
+        bg_bound = [[1500,1700],[900,1100]]
 
     if flag_B == True:
         B_shift = centroid_one_star(ref_path, B_path, star_bound, bg_bound)
